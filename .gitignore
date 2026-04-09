@@ -1,0 +1,6 @@
+.env.local
+__pycache__/
+*.pyc
+checkpoint.jsonl
+output.jsonl
+.DS_Store
