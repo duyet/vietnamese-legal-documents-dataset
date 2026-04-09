@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 checkpoint.jsonl
 output.jsonl
+cache/
 .DS_Store

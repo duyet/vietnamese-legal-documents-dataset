@@ -1,17 +1,25 @@
 """
-Generate instruction-following conversations from Vietnamese legal documents
-using free LLM APIs (OpenRouter / NVIDIA).
+Vietnamese Legal Documents → Unsloth Instruction Dataset
+
+Modes (auto-detected from flags):
+  --upload <repo>   Upload checkpoint to HuggingFace
+  --generate        Use LLMs to create QA pairs (default: simple convert)
+  --resume          Continue from last checkpoint
 
 Features:
-- Auto-detects available providers from env keys
-- Model rotation with rate limit handling and exponential backoff
-- Incremental checkpointing (safe to interrupt/resume)
-- Configurable via .env.local
+  - HTML → Markdown for better text quality
+  - Local parquet cache (fast re-runs)
+  - JSONL checkpointing (safe overnight runs)
+  - Multi-turn conversations per document
+  - Auto-detect OpenRouter / NVIDIA from .env.local
+  - Model rotation with rate limit handling
 
 Usage:
-  python generate.py --limit 100                    # generate 100 conversations
-  python generate.py --limit 1000 --resume          # resume from checkpoint
+  python generate.py                              # Build cache + preview
   python generate.py --upload duyet/vietnamese-legal-instruct
+  python generate.py --generate --limit 50        # LLM QA pairs
+  python generate.py --generate --limit 500 --resume
+  python generate.py --upload duyet/vietnamese-legal-instruct --resume
 """
 
 import argparse
@@ -25,124 +33,73 @@ from html import unescape
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
-# ── Config ──────────────────────────────────────────────────────────
 
 load_dotenv(Path(__file__).parent / ".env.local")
 
-CHECKPOINT_FILE = Path(__file__).parent / "checkpoint.jsonl"
+BASE = Path(__file__).parent
+CACHE = BASE / "cache"
+CKPT = BASE / "checkpoint.jsonl"
 
-# Default models — ranked by quality for Vietnamese text generation.
-# Override via MODEL_LIST env var (comma-separated provider/model pairs).
-# Example: MODEL_LIST="nvidia/google/gemma-4-31b-it,nvidia/qwen/qwen3.5-397b-a17b"
-DEFAULT_MODELS = [
-    # ── OpenRouter free ──
-    {"name": "google/gemma-4-31b-it:free",           "provider": "openrouter", "context": 262144, "rpm": 10},
-    {"name": "google/gemma-4-26b-a4b-it:free",       "provider": "openrouter", "context": 262144, "rpm": 10},
-    {"name": "qwen/qwen3-next-80b-a3b-instruct:free","provider": "openrouter", "context": 262144, "rpm": 10},
-    {"name": "qwen/qwen3-coder:free",                "provider": "openrouter", "context": 262000, "rpm": 10},
-    {"name": "nvidia/nemotron-3-super-120b-a12b:free","provider": "openrouter", "context": 262144, "rpm": 10},
-    {"name": "minimax/minimax-m2.5:free",             "provider": "openrouter", "context": 196608, "rpm": 10},
-    {"name": "google/gemma-3-27b-it:free",            "provider": "openrouter", "context": 131072, "rpm": 20},
-    {"name": "meta-llama/llama-3.3-70b-instruct:free","provider": "openrouter", "context": 65536,  "rpm": 20},
-    # ── NVIDIA API ──
-    {"name": "google/gemma-4-31b-it",                 "provider": "nvidia", "context": 131072, "rpm": 10},
-    {"name": "qwen/qwen3.5-397b-a17b",               "provider": "nvidia", "context": 131072, "rpm": 5},
-    {"name": "qwen/qwen3.5-122b-a10b",               "provider": "nvidia", "context": 131072, "rpm": 10},
-    {"name": "meta/llama-4-maverick-17b-128e-instruct","provider": "nvidia", "context": 131072, "rpm": 10},
-    {"name": "google/gemma-3-27b-it",                 "provider": "nvidia", "context": 131072, "rpm": 10},
-    {"name": "deepseek-ai/deepseek-v3.2",             "provider": "nvidia", "context": 131072, "rpm": 5},
+# ── Models ───────────────────────────────────────────────────────────
+
+MODELS = [
+    {"name": "google/gemma-4-31b-it:free",            "provider": "openrouter", "ctx": 262144, "rpm": 10},
+    {"name": "google/gemma-4-26b-a4b-it:free",        "provider": "openrouter", "ctx": 262144, "rpm": 10},
+    {"name": "qwen/qwen3-next-80b-a3b-instruct:free", "provider": "openrouter", "ctx": 262144, "rpm": 10},
+    {"name": "nvidia/nemotron-3-super-120b-a12b:free", "provider": "openrouter", "ctx": 262144, "rpm": 10},
+    {"name": "google/gemma-3-27b-it:free",             "provider": "openrouter", "ctx": 131072, "rpm": 20},
+    {"name": "google/gemma-4-31b-it",                  "provider": "nvidia", "ctx": 131072, "rpm": 10},
+    {"name": "qwen/qwen3.5-397b-a17b",                "provider": "nvidia", "ctx": 131072, "rpm": 5},
+    {"name": "qwen/qwen3.5-122b-a10b",                "provider": "nvidia", "ctx": 131072, "rpm": 10},
+    {"name": "meta/llama-4-maverick-17b-128e-instruct","provider": "nvidia", "ctx": 131072, "rpm": 10},
+    {"name": "google/gemma-3-27b-it",                  "provider": "nvidia", "ctx": 131072, "rpm": 10},
+    {"name": "deepseek-ai/deepseek-v3.2",              "provider": "nvidia", "ctx": 131072, "rpm": 5},
 ]
 
-# ── QA Prompt Templates ─────────────────────────────────────────────
+# ── QA Templates ─────────────────────────────────────────────────────
 
-QA_PROMPTS = [
+PROMPTS = [
     {
         "type": "summarize",
-        "system": "Bạn là trợ lý pháp luật Việt Nam. Hãy tóm tắt chính xác, ngắn gọn bằng tiếng Việt. Giữ nguyên các thuật ngữ pháp lý quan trọng.",
-        "user_template": (
-            "Dưới đây là nội dung một văn bản pháp luật Việt Nam:\n\n"
-            "---\n{content}\n---\n\n"
-            "Hãy tóm tắt văn bản trên trong 3-5 câu, bao gồm:\n"
-            "- Mục đích chính của văn bản\n"
-            "- Các đối tượng chịu tác động\n"
-            "- Những quy định quan trọng nhất"
-        ),
+        "system": "Bạn là chuyên gia pháp luật Việt Nam. Tóm tắt chính xác, ngắn gọn. Giữ thuật ngữ pháp lý. Tiếng Việt.",
+        "user": "Tóm tắt văn bản sau trong 3-5 câu (mục đích, đối tượng, quy định chính, phạm vi):\n\n```\n{content}\n```",
     },
     {
         "type": "key_provisions",
-        "system": "Bạn là chuyên gia pháp luật Việt Nam. Hãy phân tích và liệt kê chi tiết các điều khoản quan trọng. Trả lời bằng tiếng Việt.",
-        "user_template": (
-            "Phân tích văn bản pháp luật sau và liệt kê các quy định chính:\n\n"
-            "---\n{content}\n---\n\n"
-            "Hãy:\n"
-            "1. Liệt kê các điều/khoản quan trọng nhất\n"
-            "2. Giải thích ngắn gọn ý nghĩa của từng điều\n"
-            "3. Nhận xét về phạm vi áp dụng"
-        ),
+        "system": "Bạn là chuyên gia phân tích pháp luật Việt Nam. Trình bày có hệ thống. Tiếng Việt.",
+        "user": "Phân tích các quy định chính:\n\n```\n{content}\n```\n\n1. Các điều/khoản quan trọng\n2. Ý nghĩa pháp lý\n3. Phạm vi áp dụng",
     },
     {
         "type": "qa_practical",
-        "system": "Bạn là luật sư tư vấn pháp luật Việt Nam. Hãy trả lời câu hỏi thực tế dựa trên văn bản pháp luật được cung cấp. Trả lời bằng tiếng Việt, chính xác và có trích dẫn điều khoản khi cần.",
-        "user_template": (
-            "Dựa vào văn bản pháp luật sau:\n\n"
-            "---\n{content}\n---\n\n"
-            "Hãy trả lời các câu hỏi thực tế sau:\n"
-            "1. Đối tượng/person nào phải tuân thủ văn bản này?\n"
-            "2. Nghĩa vụ cụ thể của từng đối tượng là gì?\n"
-            "3. Hình thức xử lý vi phạm (nếu có)?\n"
-            "4. Cơ quan nào có thẩm quyền thực thi?"
-        ),
+        "system": "Bạn là luật sư tư vấn pháp luật Việt Nam. Trả lời chính xác, trích dẫn điều khoản. Tiếng Việt.",
+        "user": "Từ văn bản:\n\n```\n{content}\n```\n\n1. Ai phải tuân thủ?\n2. Nghĩa vụ cụ thể?\n3. Xử lý vi phạm?\n4. Cơ quan thẩm quyền?",
     },
     {
         "type": "explain_simple",
-        "system": "Bạn là người phiên dịch pháp luật. Hãy giải thích văn bản pháp luật bằng ngôn ngữ đơn giản, dễ hiểu cho người bình thường. Dùng ví dụ thực tế nếu cần.",
-        "user_template": (
-            "Hãy giải thích văn bản pháp luật sau bằng ngôn ngữ đơn giản, như đang giải thích cho một người không có kiến thức pháp lý:\n\n"
-            "---\n{content}\n---\n\n"
-            "Vui lòng:\n"
-            "- Dùng từ ngữ đơn giản, tránh thuật ngữ pháp lý phức tạp\n"
-            "- Cho ví dụ thực tế nếu có thể\n"
-            "- Tóm tắt quyền và nghĩa vụ của người dân liên quan"
-        ),
+        "system": "Bạn phiên dịch pháp luật cho công chúng. Giải thích đơn giản, ví dụ thực tế. Tiếng Việt.",
+        "user": "Giải thích cho người không biết pháp luật:\n\n```\n{content}\n```\n\nDùng từ đơn giản, ví dụ thực tế, tóm tắt quyền/nghĩa vụ.",
     },
     {
-        "type": "scope_application",
-        "system": "Bạn là chuyên gia pháp luật hành chính Việt Nam. Hãy phân tích phạm vi áp dụng và hiệu lực của văn bản pháp luật.",
-        "user_template": (
-            "Phân tích phạm vi áp dụng của văn bản pháp luật sau:\n\n"
-            "---\n{content}\n---\n\n"
-            "Hãy xác định:\n"
-            "1. Phạm vi đối tượng áp dụng\n"
-            "2. Phạm vi địa lý áp dụng\n"
-            "3. Thời hiệu lực của văn bản\n"
-            "4. Các văn bản có liên quan được dẫn chiếu\n"
-            "5. Điều kiện để áp dụng văn bản này"
-        ),
+        "type": "scope",
+        "system": "Bạn là chuyên gia pháp luật hành chính. Phân tích phạm vi áp dụng, hiệu lực. Tiếng Việt.",
+        "user": "Phạm vi áp dụng:\n\n```\n{content}\n```\n\n1. Đối tượng\n2. Phạm vi địa lý\n3. Thời gian hiệu lực\n4. Văn bản liên quan\n5. Điều kiện áp dụng",
     },
     {
-        "type": "rights_obligations",
-        "system": "Bạn là chuyên gia tư vấn pháp luật Việt Nam. Hãy phân tích chi tiết quyền và nghĩa vụ của các bên liên quan.",
-        "user_template": (
-            "Từ văn bản pháp luật sau:\n\n"
-            "---\n{content}\n---\n\n"
-            "Hãy phân tích chi tiết:\n"
-            "1. Quyền lợi của tổ chức/cá nhân theo văn bản\n"
-            "2. Nghĩa vụ của tổ chức/cá nhân theo văn bản\n"
-            "3. Trình tự, thủ tục thực hiện (nếu có)\n"
-            "4. Lợi ích và rủi ro pháp lý cần lưu ý"
-        ),
+        "type": "rights",
+        "system": "Bạn chuyên tư vấn quyền/nghĩa vụ pháp lý. Phân tích chi tiết. Tiếng Việt.",
+        "user": "Quyền và nghĩa vụ:\n\n```\n{content}\n```\n\n1. Quyền lợi\n2. Nghĩa vụ\n3. Thủ tục\n4. Rủi ro pháp lý",
     },
 ]
 
 
-# ── HTML Cleaning ────────────────────────────────────────────────────
+# ── HTML → Markdown ──────────────────────────────────────────────────
 
-def strip_html(html: str) -> str:
+def html_to_text(html: str) -> str:
+    """Convert legal document HTML to clean structured text."""
     if not html:
         return ""
+    from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "meta", "link"]):
         tag.decompose()
@@ -153,331 +110,311 @@ def strip_html(html: str) -> str:
         line = re.sub(r"[\xa0\u200b]+", " ", line).strip()
         if line:
             lines.append(line)
-    text = "\n\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return re.sub(r"\n{3,}", "\n\n", "\n\n".join(lines)).strip()
+
+
+# ── Cached Document Loader ──────────────────────────────────────────
+
+def load_documents(limit=None, min_len=200, max_len=30000):
+    """Load with local parquet cache. First run downloads + converts."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    CACHE.mkdir(exist_ok=True)
+    cache_file = CACHE / "documents.parquet"
+
+    if cache_file.exists():
+        print(f"Cache hit: {cache_file}", flush=True)
+        docs = pq.read_table(cache_file).to_pylist()
+        docs = [d for d in docs if min_len <= len(d["text"]) <= max_len]
+        if limit:
+            docs = docs[:limit]
+        print(f"  {len(docs)} docs", flush=True)
+        return docs
+
+    # Download
+    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download
+
+    print("Loading metadata…", flush=True)
+    meta_ds = load_dataset("th1nhng0/vietnamese-legal-documents", "metadata", split="data")
+    meta = {str(r["id"]): dict(r) for r in meta_ds}
+    print(f"  {len(meta)} entries", flush=True)
+
+    print("Downloading content…", flush=True)
+    path = hf_hub_download(
+        "th1nhng0/vietnamese-legal-documents", "data/content.parquet", repo_type="dataset",
+    )
+    pf = pq.ParquetFile(path)
+    total = pf.metadata.num_rows
+    print(f"  {total} rows → converting HTML to Markdown…", flush=True)
+
+    docs = []
+    loaded = 0
+    for batch in pf.iter_batches(batch_size=2000):
+        for doc_id, html in zip(batch.column("id").to_pylist(), batch.column("content_html").to_pylist()):
+            m = meta.get(str(doc_id))
+            if not m:
+                continue
+            t = html_to_text(html)
+            if not t or len(t) < 50:
+                continue
+            docs.append({
+                "id": str(doc_id), "text": t,
+                "title": m.get("title") or "", "loai_van_ban": m.get("loai_van_ban") or "",
+                "so_ky_hieu": m.get("so_ky_hieu") or "", "co_quan_ban_hanh": m.get("co_quan_ban_hanh") or "",
+                "ngay_ban_hanh": m.get("ngay_ban_hanh") or "", "pham_vi": m.get("pham_vi") or "",
+                "tinh_trang_hieu_luc": m.get("tinh_trang_hieu_luc") or "",
+                "linh_vuc": m.get("linh_vuc") or "", "nganh": m.get("nganh") or "",
+            })
+        loaded += len(batch)
+        print(f"  {loaded}/{total} → {len(docs)} valid", flush=True)
+
+    # Save cache
+    print(f"Caching {len(docs)} docs…", flush=True)
+    pq.write_table(pa.Table.from_pylist(docs), cache_file)
+
+    docs = [d for d in docs if min_len <= len(d["text"]) <= max_len]
+    if limit:
+        docs = docs[:limit]
+    print(f"  → {len(docs)} docs", flush=True)
+    return docs
 
 
 # ── LLM Client ──────────────────────────────────────────────────────
 
-class LLMClient:
-    """Unified LLM client with rate limit handling and model rotation."""
-
-    def __init__(self, models: list[dict]):
+class LLM:
+    def __init__(self, models):
         self.models = models
-        self.last_request_time: dict[str, float] = {}
-        self.dead_models: set[str] = set()  # models that returned 402
+        self._t = {}
+        self._dead = set()
 
-    def _wait_for_rate_limit(self, model: dict):
-        rpm = model.get("rpm", 10)
-        min_interval = 60.0 / rpm
-        last = self.last_request_time.get(model["name"], 0)
-        elapsed = time.time() - last
-        if elapsed < min_interval:
-            wait = min_interval - elapsed + 0.1
-            print(f"    ⏳ {wait:.1f}s rate limit wait", flush=True)
+    def call(self, msgs, idx=0):
+        for att in range(8):
+            i = (idx + att) % len(self.models)
+            m = self.models[i]
+            if m["name"] in self._dead:
+                continue
+            self._throttle(m)
+            try:
+                r = self._api(msgs, m)
+                self._t[m["name"]] = time.time()
+                return r, i
+            except requests.exceptions.HTTPError as e:
+                self._t[m["name"]] = time.time()
+                c = e.response.status_code if e.response else 0
+                if c == 429:
+                    w = min(2 ** (att + 2), 120)
+                    print(f" ⚠️429({w}s)", end="", flush=True)
+                    time.sleep(w)
+                elif c == 503:
+                    print(" ⚠️503", end="", flush=True)
+                    time.sleep(5)
+                elif c == 402:
+                    self._dead.add(m["name"])
+                elif c in (400, 401, 403):
+                    return None, i
+                else:
+                    time.sleep(10)
+            except Exception:
+                time.sleep(5)
+        return None, idx
+
+    def _throttle(self, m):
+        gap = 60.0 / m.get("rpm", 10)
+        wait = gap - (time.time() - self._t.get(m["name"], 0)) + 0.1
+        if wait > 0:
+            print(f" ⏳{wait:.0f}s", end="", flush=True)
             time.sleep(wait)
 
-    def call(self, messages: list[dict], model_idx: int = 0, max_retries: int = 6) -> tuple[str | None, int]:
-        """Call LLM, return (response_text, model_index_used)."""
-        for attempt in range(max_retries):
-            # Rotate through models starting from model_idx
-            idx = (model_idx + attempt) % len(self.models)
-            model = self.models[idx]
-
-            if model["name"] in self.dead_models:
-                continue
-
-            self._wait_for_rate_limit(model)
-
-            try:
-                result = self._api_call(messages, model)
-                self.last_request_time[model["name"]] = time.time()
-                return result, idx
-            except requests.exceptions.HTTPError as e:
-                self.last_request_time[model["name"]] = time.time()
-                status = e.response.status_code if e.response else 0
-
-                if status == 429:
-                    wait = min(2 ** (attempt + 2), 120)
-                    print(f"    ⚠️ 429 rate limit, {wait}s backoff", flush=True)
-                    time.sleep(wait)
-                elif status == 503:
-                    print(f"    ⚠️ 503 overloaded, trying next model", flush=True)
-                    time.sleep(5)
-                elif status == 402:
-                    print(f"    ❌ {model['name']} no longer free", flush=True)
-                    self.dead_models.add(model["name"])
-                elif status in (400, 401, 403):
-                    print(f"    ❌ {status}: {e.response.text[:200]}", flush=True)
-                    return None, idx
-                else:
-                    print(f"    ⚠️ HTTP {status}, retry {attempt+1}/{max_retries}", flush=True)
-                    time.sleep(10)
-            except Exception as e:
-                print(f"    ⚠️ {type(e).__name__}: {e}", flush=True)
-                time.sleep(5)
-
-        return None, model_idx
-
-    def _api_call(self, messages: list[dict], model: dict) -> str | None:
-        provider = model["provider"]
-        if provider == "openrouter":
-            return self._openrouter(messages, model)
-        elif provider == "nvidia":
-            return self._nvidia(messages, model)
+    def _api(self, msgs, m):
+        if m["provider"] == "openrouter":
+            url, key = "https://openrouter.ai/api/v1/chat/completions", os.environ["OPENROUTER_API_KEY"]
         else:
-            raise ValueError(f"Unknown provider: {provider}")
-
-    def _openrouter(self, messages: list[dict], model: dict) -> str:
-        key = os.environ.get("OPENROUTER_API_KEY")
-        if not key:
-            raise ValueError("OPENROUTER_API_KEY not set")
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": model["name"], "messages": messages, "max_tokens": 4096, "temperature": 0.7},
-            timeout=180,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-    def _nvidia(self, messages: list[dict], model: dict) -> str:
-        key = os.environ.get("NVIDIA_API_KEY")
-        base = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com")
-        if not key:
-            raise ValueError("NVIDIA_API_KEY not set")
-        resp = requests.post(
-            f"{base}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": model["name"], "messages": messages, "max_tokens": 4096, "temperature": 0.7},
-            timeout=180,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-
-# ── Data Loading ────────────────────────────────────────────────────
-
-def load_documents(limit=None, min_length=100, max_length=30000):
-    """Load and join metadata + content, streaming to control memory."""
-    import pyarrow.parquet as pq
-    from datasets import load_dataset
-    from huggingface_hub import hf_hub_download
-
-    print("Loading metadata...", flush=True)
-    meta_ds = load_dataset("th1nhng0/vietnamese-legal-documents", "metadata", split="data")
-    meta_map = {str(row["id"]): dict(row) for row in meta_ds}
-    print(f"  {len(meta_map)} metadata entries", flush=True)
-
-    print("Streaming content...", flush=True)
-    content_path = hf_hub_download(
-        "th1nhng0/vietnamese-legal-documents", "data/content.parquet", repo_type="dataset",
-    )
-
-    documents = []
-    pf = pq.ParquetFile(content_path)
-    for batch in pf.iter_batches(batch_size=1000):
-        ids = batch.column("id").to_pylist()
-        htmls = batch.column("content_html").to_pylist()
-        for doc_id, html in zip(ids, htmls):
-            if limit and len(documents) >= limit:
-                break
-            meta = meta_map.get(str(doc_id))
-            if not meta:
-                continue
-            text = strip_html(html)
-            if not text or len(text) < min_length or len(text) > max_length:
-                continue
-            documents.append({"id": doc_id, "meta": meta, "text": text})
-        if limit and len(documents) >= limit:
-            break
-
-    print(f"  {len(documents)} documents loaded", flush=True)
-    return documents
+            url = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com") + "/v1/chat/completions"
+            key = os.environ["NVIDIA_API_KEY"]
+        r = requests.post(url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                          json={"model": m["name"], "messages": msgs, "max_tokens": 4096, "temperature": 0.7}, timeout=180)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
 
 
 # ── Checkpoint ──────────────────────────────────────────────────────
 
-def save_checkpoint(records: list[dict], path: Path = CHECKPOINT_FILE):
-    with open(path, "a") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+def ckpt_append(recs):
+    with open(CKPT, "a") as f:
+        for r in recs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-
-def get_processed_ids(path: Path = CHECKPOINT_FILE) -> set:
-    if not path.exists():
+def ckpt_done_ids():
+    if not CKPT.exists():
         return set()
-    ids = set()
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                ids.add(json.loads(line).get("source_id"))
-    return ids
+    return {json.loads(l)["source_id"] for l in CKPT.read_text().splitlines() if l.strip()}
 
-
-def load_all_records(path: Path = CHECKPOINT_FILE) -> list[dict]:
-    if not path.exists():
+def ckpt_load():
+    if not CKPT.exists():
         return []
-    records = []
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return records
+    return [json.loads(l) for l in CKPT.read_text().splitlines() if l.strip()]
 
 
-# ── Model Selection ─────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────
 
-def get_available_models() -> list[dict]:
-    """Filter DEFAULT_MODELS by available API keys. Override with MODEL_LIST env."""
-    env_override = os.environ.get("MODEL_LIST")
-    if env_override:
-        models = []
-        for entry in env_override.split(","):
+def pick_models():
+    ov = os.environ.get("MODEL_LIST")
+    if ov:
+        out = []
+        for entry in ov.split(","):
             entry = entry.strip()
             if "/" not in entry:
                 continue
-            provider, name = entry.split("/", 1)
-            models.append({"name": name, "provider": provider, "context": 131072, "rpm": 10})
-        return models
+            p, n = entry.split("/", 1)
+            out.append({"name": n, "provider": p, "ctx": 131072, "rpm": 10})
+        return out
+    has_or, has_nv = bool(os.environ.get("OPENROUTER_API_KEY")), bool(os.environ.get("NVIDIA_API_KEY"))
+    return [m for m in MODELS if (m["provider"] == "openrouter" and has_or) or (m["provider"] == "nvidia" and has_nv)]
 
-    available = []
-    has_or = bool(os.environ.get("OPENROUTER_API_KEY"))
-    has_nv = bool(os.environ.get("NVIDIA_API_KEY"))
 
-    for m in DEFAULT_MODELS:
-        if (m["provider"] == "openrouter" and has_or) or (m["provider"] == "nvidia" and has_nv):
-            available.append(m)
-    return available
+def meta_header(doc):
+    parts = [f"Loại văn bản: {doc.get('loai_van_ban') or 'Không rõ'}", f"Tiêu đề: {doc.get('title') or ''}"]
+    for k, l in [("so_ky_hieu","Số/Ký hiệu"),("co_quan_ban_hanh","Cơ quan ban hành"),
+                  ("ngay_ban_hanh","Ngày ban hành"),("pham_vi","Phạm vi"),
+                  ("tinh_trang_hieu_luc","Trạng thái"),("linh_vuc","Lĩnh vực"),("nganh","Ngành")]:
+        if doc.get(k):
+            parts.append(f"{l}: {doc[k]}")
+    return "\n".join(parts)
+
+
+def upload(repo, private):
+    from datasets import Dataset
+    recs = ckpt_load()
+    if not recs:
+        print("No records!")
+        return
+    print(f"Uploading {len(recs)} records → {repo}…", flush=True)
+    ds = Dataset.from_list(recs)
+    split = ds.train_test_split(test_size=0.05, seed=42)
+    split.push_to_hub(repo, private=private, token=os.environ.get("HF_TOKEN"))
+    print(f"Done! https://huggingface.co/datasets/{repo}")
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate legal QA conversations")
-    parser.add_argument("--limit", type=int, default=100)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--upload", type=str, default=None)
-    parser.add_argument("--private", action="store_true")
-    parser.add_argument("--qa-types", type=int, default=2, help="QA variations per document")
-    parser.add_argument("--min-length", type=int, default=200)
-    parser.add_argument("--max-length", type=int, default=30000)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Vietnamese Legal → Unsloth Dataset")
+    ap.add_argument("--generate", action="store_true", help="Use LLMs for QA pairs (default: simple convert)")
+    ap.add_argument("--upload", type=str, default=None, help="Upload to HF dataset repo")
+    ap.add_argument("--resume", action="store_true", help="Continue from checkpoint")
+    ap.add_argument("--private", action="store_true")
+    ap.add_argument("--limit", type=int, default=None, help="Max documents to process")
+    ap.add_argument("--qa-types", type=int, default=2, help="QA variations per doc (generate mode)")
+    ap.add_argument("--min-length", type=int, default=200)
+    ap.add_argument("--max-length", type=int, default=30000)
+    ap.add_argument("--clear-cache", action="store_true", help="Delete local cache and exit")
+    args = ap.parse_args()
 
-    # Models
-    models = get_available_models()
-    if not models:
-        print("❌ No API keys or models configured!")
-        print("   Set OPENROUTER_API_KEY or NVIDIA_API_KEY in .env.local")
-        print("   Or set MODEL_LIST=provider/model,provider/model")
-        sys.exit(1)
+    if args.clear_cache:
+        import shutil
+        shutil.rmtree(CACHE, ignore_errors=True)
+        print("Cache cleared.")
+        return
 
-    print(f"Available models ({len(models)}):")
-    for m in models:
-        print(f"  {m['provider']:12} {m['name']:<55} ctx={m['context']:>8} rpm={m['rpm']}")
-    print()
+    # Load docs (cached after first run)
+    docs = load_documents(limit=args.limit, min_len=args.min_length, max_len=args.max_length)
 
-    # Load data
-    processed_ids = get_processed_ids() if args.resume else set()
-    print(f"Previously processed: {len(processed_ids)}", flush=True)
+    if args.generate:
+        # ── LLM Generation Mode ──
+        models = pick_models()
+        if not models:
+            print("❌ Set OPENROUTER_API_KEY or NVIDIA_API_KEY in .env.local")
+            sys.exit(1)
+        print(f"\nModels ({len(models)}):")
+        for m in models:
+            print(f"  {m['provider']:12} {m['name']:<55} rpm={m['rpm']}")
 
-    documents = load_documents(limit=None, min_length=args.min_length, max_length=args.max_length)
+        done = ckpt_done_ids() if args.resume else set()
+        if done:
+            docs = [d for d in docs if d["id"] not in done]
+            print(f"Resuming: {len(done)} done, {len(docs)} remaining", flush=True)
 
-    # Filter already processed
-    if processed_ids:
-        before = len(documents)
-        documents = [d for d in documents if d["id"] not in processed_ids]
-        print(f"Skipped {before - len(documents)} already-processed", flush=True)
+        if not docs:
+            print("Nothing to process!")
+            if args.upload:
+                upload(args.upload, args.private)
+            return
 
-    if args.limit:
-        documents = documents[:args.limit]
+        llm = LLM(models)
+        mi, batch, ok, fail = 0, [], 0, 0
+        print(f"\n▶ {len(docs)} docs × {args.qa_types} QA\n", flush=True)
 
-    if not documents:
-        print("No documents to process!")
-        if args.upload:
-            print("Uploading existing records...")
-            _upload(args)
-        sys.exit(0)
+        for i, doc in enumerate(docs):
+            text = doc["text"]
+            cap = models[mi % len(models)]["ctx"] - 6000
+            if len(text) > cap:
+                text = text[:cap] + "\n\n…(cắt ngắn)"
 
-    print(f"\nProcessing {len(documents)} documents × {args.qa_types} QA types = ~{len(documents) * args.qa_types} calls\n", flush=True)
+            qas = random.sample(PROMPTS, min(args.qa_types, len(PROMPTS)))
+            for qa in qas:
+                user_msg = qa["user"].format(content=text)
+                msgs = [{"role": "system", "content": qa["system"]}, {"role": "user", "content": user_msg}]
+                print(f"  [{i+1}/{len(docs)}] {qa['type']:<18}", end="", flush=True)
+                resp, mi = llm.call(msgs, mi)
 
-    # Generate
-    client = LLMClient(models)
-    model_idx = 0
-    batch = []
-    total = 0
-    failed = 0
+                if not resp:
+                    print(" ❌", flush=True)
+                    fail += 1
+                    continue
+                print(f" ✅ {len(resp):>5}c", flush=True)
+                batch.append({
+                    "source_id": doc["id"], "document_type": doc.get("loai_van_ban") or "",
+                    "qa_type": qa["type"],
+                    "conversations": [
+                        {"role": "system", "content": qa["system"]},
+                        {"role": "user", "content": user_msg},
+                        {"role": "assistant", "content": resp},
+                    ],
+                })
+                ok += 1
 
-    for i, doc in enumerate(documents):
-        text = doc["text"]
-        meta = doc["meta"]
+            if batch and (i + 1) % 10 == 0:
+                ckpt_append(batch)
+                batch = []
+                print(f"  💾 {ok} ok, {fail} fail", flush=True)
 
-        # Truncate to fit model context
-        model = models[model_idx % len(models)]
-        max_input = model["context"] - 6000
-        if len(text) > max_input:
-            text = text[:max_input] + "\n\n...(nội dung được cắt ngắn)"
+        if batch:
+            ckpt_append(batch)
+        print(f"\n✅ {ok} ok, {fail} fail", flush=True)
 
-        qa_types = random.sample(QA_PROMPTS, min(args.qa_types, len(QA_PROMPTS)))
+    else:
+        # ── Simple Convert Mode (no LLM) ──
+        done = ckpt_done_ids() if args.resume else set()
+        if done:
+            docs = [d for d in docs if d["id"] not in done]
+        if not docs:
+            print("Nothing to process!")
+            if args.upload:
+                upload(args.upload, args.private)
+            return
 
-        for qa in qa_types:
-            user_msg = qa["user_template"].format(content=text)
-            messages = [
-                {"role": "system", "content": qa["system"]},
-                {"role": "user", "content": user_msg},
-            ]
-
-            print(f"  [{i+1}/{len(documents)}] {qa['type']:<20} ", end="", flush=True)
-            response, model_idx = client.call(messages, model_idx)
-
-            if not response:
-                print("❌ all models failed", flush=True)
-                failed += 1
-                continue
-
-            print(f"✅ {len(response):>5} chars via {models[model_idx]['name'][:40]}", flush=True)
-
+        print(f"\nConverting {len(docs)} docs…", flush=True)
+        batch = []
+        for i, doc in enumerate(docs):
             batch.append({
-                "source_id": doc["id"],
-                "document_type": meta.get("loai_van_ban") or "",
-                "qa_type": qa["type"],
+                "source_id": doc["id"], "document_type": doc.get("loai_van_ban") or "",
+                "qa_type": "full_text",
                 "conversations": [
-                    {"role": "system", "content": qa["system"]},
-                    {"role": "user", "content": user_msg},
-                    {"role": "assistant", "content": response},
+                    {"role": "user", "content": f"Cho văn bản pháp luật sau:\n\n{meta_header(doc)}\n\nHãy trình bày nội dung đầy đủ."},
+                    {"role": "assistant", "content": doc["text"]},
                 ],
             })
-            total += 1
+            if (i + 1) % 500 == 0:
+                print(f"  {i+1}/{len(docs)}", flush=True)
 
-        # Checkpoint every 10 docs
-        if batch and (i + 1) % 10 == 0:
-            save_checkpoint(batch)
-            print(f"  💾 checkpoint: {total} records, {failed} failed\n", flush=True)
-            batch = []
-
-    # Save remaining
-    if batch:
-        save_checkpoint(batch)
-
-    print(f"\n✅ Done: {total} generated, {failed} failed", flush=True)
+        ckpt_append(batch)
+        print(f"  {len(batch)} records saved", flush=True)
 
     # Upload
     if args.upload:
-        _upload(args)
-
-
-def _upload(args):
-    from datasets import Dataset
-    records = load_all_records()
-    if not records:
-        print("No records to upload!")
-        return
-    print(f"Uploading {len(records)} records to {args.upload}...")
-    ds = Dataset.from_list(records)
-    split = ds.train_test_split(test_size=0.05, seed=42)
-    split.push_to_hub(args.upload, private=args.private, token=os.environ.get("HF_TOKEN"))
-    print(f"Done! https://huggingface.co/datasets/{args.upload}")
+        upload(args.upload, args.private)
 
 
 if __name__ == "__main__":
