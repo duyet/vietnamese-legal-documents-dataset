@@ -4,7 +4,7 @@ language:
 license: cc-by-4.0
 task_categories:
 - text-generation
-- conversational
+- question-answering
 tags:
 - vietnamese
 - legal
