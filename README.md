@@ -10,7 +10,6 @@ tags:
 - legal
 - instruction-tuning
 - unsloth
-- gemma-4
 - fine-tuning
 - law
 size_categories:
