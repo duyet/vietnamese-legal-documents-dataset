@@ -23,31 +23,31 @@ size_categories:
 
 Instruction-following dataset built from [th1nhng0/vietnamese-legal-documents](https://huggingface.co/datasets/th1nhng0/vietnamese-legal-documents) — 127K Vietnamese legal documents from [vbpl.vn](https://vbpl.vn) (Government Legal Document Portal, Ministry of Justice).
 
-**233,866 training pairs** across 9 QA types with deep Vietnamese legal hierarchy knowledge.
+**341,398 training pairs** across 9 QA types with deep Vietnamese legal hierarchy knowledge. Every document has a `full_text` pair for content recall.
 
 ## Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total records | 233,866 |
+| Total records | 341,398 |
 | Source documents | 116,933 (from 127,271 unique, filtered by length) |
 | QA types | 9 |
-| Train split | 222,173 (95%) |
-| Test split | 11,693 (5%) |
+| Train split | 324,329 (95%) |
+| Test split | 17,069 (5%) |
 
 ### QA Type Distribution
 
-| Type | Count | Description |
-|------|------:|-------------|
-| `summarize` | 42,502 | 3-5 sentence structured summary |
-| `qa_practical` | 35,488 | Practical compliance Q&A |
-| `explain_simple` | 35,334 | Plain language for non-lawyers |
-| `classify` | 27,143 | Document type & hierarchy position |
-| `scope` | 27,085 | Scope, applicability, effective dates |
-| `key_provisions` | 26,163 | Key articles and provisions |
-| `legal_basis` | 21,636 | Legal basis chain analysis |
-| `full_text` | 9,401 | Full document text |
-| `amounts` | 9,114 | Monetary amounts & percentages |
+| Type | Count | % | Description |
+|------|------:|--:|-------------|
+| `full_text` | 116,933 | 34.3 | Full document content (1 per doc for content recall) |
+| `summarize` | 42,502 | 12.4 | 3-5 sentence structured summary |
+| `qa_practical` | 35,488 | 10.4 | Practical compliance Q&A |
+| `explain_simple` | 35,334 | 10.3 | Plain language for non-lawyers |
+| `classify` | 27,143 | 8.0 | Document type & hierarchy position |
+| `scope` | 27,085 | 7.9 | Scope, applicability, effective dates |
+| `key_provisions` | 26,163 | 7.7 | Key articles and provisions |
+| `legal_basis` | 21,636 | 6.3 | Legal basis chain analysis |
+| `amounts` | 9,114 | 2.7 | Monetary amounts & percentages |
 
 ### Document Type Distribution (top 10)
 
@@ -161,7 +161,7 @@ python generate.py --qa-types 2 --upload duyet/vietnamese-legal-instruct
   publisher = {Hugging Face},
   doi       = {10.57967/hf/8343},
   url       = {https://huggingface.co/datasets/duyet/vietnamese-legal-instruct},
-  note      = {233K instruction pairs from 127K Vietnamese legal documents, 9 QA types}
+  note      = {341K instruction pairs from 127K Vietnamese legal documents, 9 QA types}
 }
 
 @dataset{thinhngo_vietnamese_legal_2025,
