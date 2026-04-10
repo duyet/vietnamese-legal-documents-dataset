@@ -13,6 +13,7 @@ Convert [th1nhng0/vietnamese-legal-documents](https://huggingface.co/datasets/th
 | Generate | `python generate.py --generate --limit 100` | LLM QA pairs via NVIDIA/OpenRouter |
 | Resume | `python generate.py --generate --resume --limit 1000` | Continue from checkpoint |
 | Upload | `python generate.py --resume --upload <repo>` | Upload checkpoint to HF |
+| Fresh | `python generate.py --fresh --upload <repo>` | Delete checkpoint and regenerate all |
 | Clear cache | `python generate.py --clear-cache` | Delete local parquet cache |
 
 ## Architecture
@@ -38,7 +39,7 @@ Unsloth-compatible `conversations` with `role`/`content`:
 }
 ```
 
-## QA Types (9 variations)
+## QA Types (14 variations)
 
 | Type | System Prompt | Focus |
 |------|---------------|-------|
@@ -50,7 +51,12 @@ Unsloth-compatible `conversations` with `role`/`content`:
 | `classify` | Classification expert | Document type and hierarchy position |
 | `legal_basis` | Legal researcher | Legal basis chain analysis |
 | `amounts` | Lawyer | Monetary amounts and percentages |
-| `full_text` | Legal expert | Full document text |
+| `full_text` | Legal expert | Full document text (1 per doc, always) |
+| `meta_type` | Classifier | Document type + hierarchy level |
+| `meta_issuer` | Legal expert | Issuing authority + date |
+| `meta_date` | Admin expert | Issue date + effective date + status |
+| `meta_title` | Legal expert | Title + subject + field |
+| `meta_status` | Admin expert | Current legal status |
 
 ## Models
 

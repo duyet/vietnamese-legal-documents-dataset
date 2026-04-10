@@ -3,8 +3,9 @@ Vietnamese Legal Documents → Unsloth Instruction Dataset
 
 Single script: downloads, caches (DuckDB), generates QA pairs, uploads to HF.
 
-9 QA types with Vietnamese legal hierarchy knowledge:
-  summarize, explain, practical, provisions, classify, scope, legal_basis, amounts, full_text
+14 QA types — 9 analysis + 5 short metadata recall:
+  summarize, explain, practical, provisions, classify, scope, legal_basis, amounts, full_text,
+  meta_type, meta_issuer, meta_date, meta_title, meta_status
 
 Usage:
   python generate.py                                      # Build cache + preview
@@ -322,28 +323,126 @@ def gen_full_text(doc):
         {"role": "user", "content": f"Trình bày nội dung đầy đủ:\n\n{meta_block(doc)}"},
         {"role": "assistant", "content": doc["text"]}]}
 
-# Generator registry with weights
+# ── 5 Short Metadata Recall Generators ───────────────────────────────
+
+def gen_meta_type(doc):
+    """Short: document type and hierarchy position."""
+    doc_type = doc.get("loai_van_ban", "")
+    so = doc.get("so_ky_hieu", "")
+    if not doc_type: return None
+    info = DOC_HIERARCHY.get(doc_type, {})
+    level = info.get("level", "")
+    issuer = info.get("issuer", doc.get("co_quan_ban_hanh", ""))
+    scope_desc = info.get("scope", "")
+    levels = {1: "Luật/Bộ luật", 2: "Pháp lệnh/Lệnh", 3: "Nghị định/Nghị quyết",
+              4: "Thông tư/Quyết định", 5: "Chỉ thị"}
+    resp = f"Văn bản số {so} là {doc_type}"
+    if level: resp += f", thuộc cấp {level} ({levels.get(level, '')}) trong hệ thống pháp luật Việt Nam"
+    resp += f". Do {issuer} ban hành"
+    if scope_desc: resp += f", phạm vi {scope_desc}"
+    resp += "."
+    return {"qa_type": "meta_type", "conversations": [
+        {"role": "system", "content": SYSTEM_PROMPTS["classifier"]},
+        {"role": "user", "content": f"Văn bản số {so} thuộc loại nào? Xếp ở cấp nào trong hệ thống pháp luật?"},
+        {"role": "assistant", "content": resp}]}
+
+def gen_meta_issuer(doc):
+    """Short: who issued the document."""
+    issuer = doc.get("co_quan_ban_hanh", "")
+    so = doc.get("so_ky_hieu", "")
+    doc_type = doc.get("loai_van_ban", "văn bản")
+    date = doc.get("ngay_ban_hanh", "")
+    if not issuer: return None
+    resp = f"{doc_type} số {so} do {issuer} ban hành"
+    if date: resp += f" ngày {date}"
+    resp += f". Đây là {_explain_doc_type(doc_type)}, do cơ quan có thẩm quyền ban hành."
+    return {"qa_type": "meta_issuer", "conversations": [
+        {"role": "system", "content": SYSTEM_PROMPTS["expert"]},
+        {"role": "user", "content": f"Ai ban hành {doc_type} số {so}? Cơ quan nào có thẩm quyền?"},
+        {"role": "assistant", "content": resp}]}
+
+def gen_meta_date(doc):
+    """Short: issue date and effective date."""
+    date = doc.get("ngay_ban_hanh", "")
+    if not date: return None
+    so = doc.get("so_ky_hieu", "")
+    doc_type = doc.get("loai_van_ban", "văn bản")
+    eff = extract_effective_date(doc["text"])
+    status = doc.get("tinh_trang_hieu_luc", "")
+    resp = f"{doc_type} số {so} được ban hành ngày {date}."
+    if eff: resp += f" Có hiệu lực từ {eff}."
+    if status: resp += f" Tình trạng hiện tại: {status}."
+    return {"qa_type": "meta_date", "conversations": [
+        {"role": "system", "content": SYSTEM_PROMPTS["admin"]},
+        {"role": "user", "content": f"{doc_type} số {so} ban hành khi nào? Khi nào có hiệu lực?"},
+        {"role": "assistant", "content": resp}]}
+
+def gen_meta_title(doc):
+    """Short: document title and subject."""
+    title = doc.get("title", "")
+    if not title: return None
+    so = doc.get("so_ky_hieu", "")
+    doc_type = doc.get("loai_van_ban", "văn bản")
+    issuer = doc.get("co_quan_ban_hanh", "")
+    linh_vuc = doc.get("linh_vuc", "")
+    resp = f"{doc_type} số {so} có tiêu đề \"{title.strip()}\", do {issuer} ban hành."
+    if linh_vuc: resp += f" Lĩnh vực: {linh_vuc}."
+    return {"qa_type": "meta_title", "conversations": [
+        {"role": "system", "content": SYSTEM_PROMPTS["expert"]},
+        {"role": "user", "content": f"{doc_type} số {so} quy định về vấn đề gì? Trích tiêu đề?"},
+        {"role": "assistant", "content": resp}]}
+
+def gen_meta_status(doc):
+    """Short: current legal status."""
+    status = doc.get("tinh_trang_hieu_luc", "")
+    if not status: return None
+    so = doc.get("so_ky_hieu", "")
+    doc_type = doc.get("loai_van_ban", "văn bản")
+    date = doc.get("ngay_ban_hanh", "")
+    resp = f"{doc_type} số {so}"
+    if date: resp += f" (ban hành ngày {date})"
+    resp += f" — tình trạng hiệu lực: {status}."
+    if "hết hiệu lực" in status.lower():
+        resp += " Văn bản này không còn giá trị áp dụng pháp lý."
+    elif "còn hiệu lực" in status.lower():
+        resp += " Văn bản này đang có giá trị pháp lý, phải tuân thủ."
+    return {"qa_type": "meta_status", "conversations": [
+        {"role": "system", "content": SYSTEM_PROMPTS["admin"]},
+        {"role": "user", "content": f"{doc_type} số {so} còn hiệu lực không? Tình trạng hiện tại?"},
+        {"role": "assistant", "content": resp}]}
+
+# Generator registry with weights (full_text always generated separately)
 GENERATORS = [
     (gen_summarize, 5), (gen_provisions, 4), (gen_practical, 4), (gen_explain, 4),
-    (gen_scope, 3), (gen_classify, 3), (gen_legal_basis, 3), (gen_amounts, 2), (gen_full_text, 1),
+    (gen_scope, 5), (gen_classify, 5), (gen_legal_basis, 3), (gen_amounts, 2),
+    (gen_meta_type, 4), (gen_meta_issuer, 4), (gen_meta_date, 4),
+    (gen_meta_title, 4), (gen_meta_status, 3),
 ]
 
-def generate_for_doc(doc, qa_count=2):
+def generate_for_doc(doc, qa_count=3):
+    results = []
+    # Always generate full_text for every doc (content recall)
+    ft = gen_full_text(doc)
+    if ft and len(ft["conversations"][-1]["content"]) >= 60:
+        ft["source_id"] = doc["id"]
+        ft["document_type"] = doc.get("loai_van_ban", "")
+        results.append(ft)
+    # Weighted random selection for other QA types
     pool = []
     for fn, w in GENERATORS:
         pool.extend([fn] * w)
     random.shuffle(pool)
-    results, seen = [], set()
+    seen = set()
+    target = len(results) + qa_count
     for fn in pool:
-        if len(results) >= qa_count: break
+        if len(results) >= target: break
         try:
             rec = fn(doc)
         except Exception:
             continue
         if rec is None or rec["qa_type"] in seen: continue
-        # Quality filter: min 100 chars in assistant response
         assistant = rec["conversations"][-1]["content"]
-        if len(assistant) < 100: continue
+        if len(assistant) < 60: continue
         seen.add(rec["qa_type"])
         rec["source_id"] = doc["id"]
         rec["document_type"] = doc.get("loai_van_ban", "")
@@ -535,16 +634,21 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--private", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--qa-types", type=int, default=2, help="QA variations per doc")
+    ap.add_argument("--qa-types", type=int, default=3, help="QA variations per doc (excluding full_text)")
     ap.add_argument("--min-length", type=int, default=200)
     ap.add_argument("--max-length", type=int, default=30000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--clear-cache", action="store_true")
+    ap.add_argument("--fresh", action="store_true", help="Delete checkpoint and regenerate all")
     args = ap.parse_args()
 
     if args.clear_cache:
         import shutil
         shutil.rmtree(CACHE, ignore_errors=True); print("Cache cleared."); return
+
+    if args.fresh and CKPT.exists():
+        CKPT.unlink()
+        print("Checkpoint cleared (fresh start).")
 
     random.seed(args.seed)
     build_cache()

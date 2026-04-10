@@ -21,33 +21,40 @@ size_categories:
 
 # Vietnamese Legal Instruction Dataset
 
+**Dataset**: [huggingface.co/datasets/duyet/vietnamese-legal-instruct](https://huggingface.co/datasets/duyet/vietnamese-legal-instruct) | **Source code**: [github.com/duyet/vietnamese-legal-documents-dataset](https://github.com/duyet/vietnamese-legal-documents-dataset)
+
 Instruction-following dataset built from [th1nhng0/vietnamese-legal-documents](https://huggingface.co/datasets/th1nhng0/vietnamese-legal-documents) — 127K Vietnamese legal documents from [vbpl.vn](https://vbpl.vn) (Government Legal Document Portal, Ministry of Justice).
 
-**341,398 training pairs** across 9 QA types with deep Vietnamese legal hierarchy knowledge. Every document has a `full_text` pair for content recall.
+**467,732 training pairs** across 14 QA types with deep Vietnamese legal hierarchy knowledge. Every document has a `full_text` pair for content recall, plus 5 short metadata recall types for memorization.
 
 ## Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total records | 341,398 |
+| Total records | 467,732 |
 | Source documents | 116,933 (from 127,271 unique, filtered by length) |
-| QA types | 9 |
-| Train split | 324,329 (95%) |
-| Test split | 17,069 (5%) |
+| QA types | 14 |
+| Train split | 444,346 (95%) |
+| Test split | 23,386 (5%) |
 
 ### QA Type Distribution
 
 | Type | Count | % | Description |
 |------|------:|--:|-------------|
-| `full_text` | 116,933 | 34.3 | Full document content (1 per doc for content recall) |
-| `summarize` | 42,502 | 12.4 | 3-5 sentence structured summary |
-| `qa_practical` | 35,488 | 10.4 | Practical compliance Q&A |
-| `explain_simple` | 35,334 | 10.3 | Plain language for non-lawyers |
-| `classify` | 27,143 | 8.0 | Document type & hierarchy position |
-| `scope` | 27,085 | 7.9 | Scope, applicability, effective dates |
-| `key_provisions` | 26,163 | 7.7 | Key articles and provisions |
-| `legal_basis` | 21,636 | 6.3 | Legal basis chain analysis |
-| `amounts` | 9,114 | 2.7 | Monetary amounts & percentages |
+| `full_text` | 116,933 | 25.0 | Full document content (1 per doc for content recall) |
+| `scope` | 35,715 | 7.6 | Scope, applicability, effective dates |
+| `classify` | 35,401 | 7.6 | Document type & hierarchy position |
+| `summarize` | 35,226 | 7.5 | 3-5 sentence structured summary |
+| `meta_date` | 29,247 | 6.3 | Issue date & effective date (short) |
+| `explain_simple` | 29,176 | 6.2 | Plain language for non-lawyers |
+| `meta_issuer` | 29,059 | 6.2 | Issuing authority (short) |
+| `meta_title` | 29,049 | 6.2 | Title & subject (short) |
+| `meta_type` | 29,013 | 6.2 | Document type & hierarchy level (short) |
+| `qa_practical` | 28,982 | 6.2 | Practical compliance Q&A |
+| `meta_status` | 22,201 | 4.7 | Current legal status (short) |
+| `key_provisions` | 22,061 | 4.7 | Key articles and provisions |
+| `legal_basis` | 17,867 | 3.8 | Legal basis chain analysis |
+| `amounts` | 7,802 | 1.7 | Monetary amounts & percentages |
 
 ### Document Type Distribution (top 10)
 
@@ -134,15 +141,18 @@ trainer.train()
 
 GitHub: [duyet/vietnamese-legal-documents-dataset](https://github.com/duyet/vietnamese-legal-documents-dataset) | Source code: [`generate.py`](https://huggingface.co/datasets/duyet/vietnamese-legal-instruct/blob/main/generate.py)
 
-Built with 9 local QA generators (no LLM API calls needed):
+Built with 14 local QA generators (no LLM API calls needed):
+- 9 analysis types: summarize, key_provisions, qa_practical, explain_simple, scope, classify, legal_basis, amounts, full_text
+- 5 short metadata recall types: meta_type, meta_issuer, meta_date, meta_title, meta_status
 - Vietnamese legal hierarchy knowledge baked into system prompts
-- Quality-filtered: min 100 char responses, no within-doc duplicates
+- Quality-filtered: min 60 char responses, no within-doc duplicates
+- Every doc gets 1 full_text + 3 random QA types = 4 records per doc
 - DuckDB-backed cache for memory-efficient processing (~145 MB RSS)
 
 ```bash
 # Reproduce the dataset
 pip install requests python-dotenv beautifulsoup4 lxml pyarrow datasets duckdb
-python generate.py --qa-types 2 --upload duyet/vietnamese-legal-instruct
+python generate.py --fresh --qa-types 3 --upload duyet/vietnamese-legal-instruct
 ```
 
 ## Source
@@ -161,15 +171,6 @@ python generate.py --qa-types 2 --upload duyet/vietnamese-legal-instruct
   publisher = {Hugging Face},
   doi       = {10.57967/hf/8343},
   url       = {https://huggingface.co/datasets/duyet/vietnamese-legal-instruct},
-  note      = {341K instruction pairs from 127K Vietnamese legal documents, 9 QA types}
-}
-
-@dataset{thinhngo_vietnamese_legal_2025,
-  title     = {Vietnamese Legal Documents},
-  author    = {Thinh Ngo},
-  year      = {2025},
-  publisher = {Hugging Face},
-  url       = {https://huggingface.co/datasets/th1nhng0/vietnamese-legal-documents},
-  note      = {Source: vbpl.vn, Ministry of Justice, Vietnam}
+  note      = {468K instruction pairs from 127K Vietnamese legal documents, 14 QA types}
 }
 ```
