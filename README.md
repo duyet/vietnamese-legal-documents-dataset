@@ -132,7 +132,7 @@ trainer.train()
 
 ## Generation
 
-Source code: [`generate.py`](https://huggingface.co/datasets/duyet/vietnamese-legal-instruct/blob/main/generate.py)
+GitHub: [duyet/vietnamese-legal-documents-dataset](https://github.com/duyet/vietnamese-legal-documents-dataset) | Source code: [`generate.py`](https://huggingface.co/datasets/duyet/vietnamese-legal-instruct/blob/main/generate.py)
 
 Built with 9 local QA generators (no LLM API calls needed):
 - Vietnamese legal hierarchy knowledge baked into system prompts
@@ -159,6 +159,7 @@ python generate.py --qa-types 2 --upload duyet/vietnamese-legal-instruct
   author    = {Duyet Le},
   year      = {2026},
   publisher = {Hugging Face},
+  doi       = {10.57967/hf/8343},
   url       = {https://huggingface.co/datasets/duyet/vietnamese-legal-instruct},
   note      = {233K instruction pairs from 127K Vietnamese legal documents, 9 QA types}
 }
