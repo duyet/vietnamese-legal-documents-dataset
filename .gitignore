@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 checkpoint.jsonl
-output.jsonl
 cache/
+*.jsonl
 .DS_Store
+generate.log

@@ -17,7 +17,7 @@ Convert [th1nhng0/vietnamese-legal-documents](https://huggingface.co/datasets/th
 
 ## Architecture
 
-- **Cache**: First run downloads + strips HTML → saves `cache/documents.parquet` (156K docs). Re-runs are instant.
+- **Cache**: First run downloads + strips HTML → saves `cache/documents.duckdb` (156K docs). Re-runs are instant.
 - **Checkpoint**: `checkpoint.jsonl` — append-only, safe to Ctrl+C. `--resume` skips already-processed docs.
 - **Auto-detect**: Reads `.env.local` for API keys, filters models by available providers.
 - **Rate limits**: Per-model RPM tracking, exponential backoff on 429/503, auto-rotation on failure.
@@ -38,7 +38,7 @@ Unsloth-compatible `conversations` with `role`/`content`:
 }
 ```
 
-## QA Types (6 variations)
+## QA Types (9 variations)
 
 | Type | System Prompt | Focus |
 |------|---------------|-------|
@@ -47,7 +47,10 @@ Unsloth-compatible `conversations` with `role`/`content`:
 | `qa_practical` | Lawyer | Practical Q&A |
 | `explain_simple` | Public translator | Plain language for non-lawyers |
 | `scope` | Administrative law expert | Scope, applicability, effectivity |
-| `rights` | Rights/obligations expert | Rights, duties, procedures |
+| `classify` | Classification expert | Document type and hierarchy position |
+| `legal_basis` | Legal researcher | Legal basis chain analysis |
+| `amounts` | Lawyer | Monetary amounts and percentages |
+| `full_text` | Legal expert | Full document text |
 
 ## Models
 
