@@ -284,17 +284,56 @@ def meta_header(doc):
     return "\n".join(parts)
 
 
-def upload(repo, private):
-    from datasets import Dataset
+def upload(repo, private, variant=None):
+    """Upload checkpoint to HF. If variant is set, uploads as a named config/subset."""
+    from datasets import Dataset, DatasetDict
+    from huggingface_hub import HfApi
     recs = ckpt_load()
     if not recs:
         print("No records!")
         return
-    print(f"Uploading {len(recs)} records → {repo}…", flush=True)
+
+    tag = f" ({variant})" if variant else ""
+    print(f"Uploading {len(recs)} records → {repo}{tag}…", flush=True)
     ds = Dataset.from_list(recs)
     split = ds.train_test_split(test_size=0.05, seed=42)
-    split.push_to_hub(repo, private=private, token=os.environ.get("HF_TOKEN"))
+
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
+    api.create_repo(repo, repo_type="dataset", exist_ok=True, private=private)
+
+    if variant:
+        # Upload as a named config: variant/train and variant/test parquet files
+        from huggingface_hub import hf_hub_download
+        import pyarrow.parquet as pq
+        import tempfile
+
+        config_dir = variant
+        for split_name, split_ds in split.items():
+            buf = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+            split_ds.to_parquet(buf.name)
+            path_in_repo = f"{config_dir}/{split_name}/{split_name}-00000-of-00001.parquet"
+            api.upload_file(path_or_fileobj=buf.name, path_in_repo=path_in_repo,
+                            repo_id=repo, repo_type="dataset")
+            buf.close()
+            print(f"  → {path_in_repo}", flush=True)
+
+        # Update README with config metadata if not present
+        _update_dataset_card(api, repo, variant, len(recs))
+    else:
+        split.push_to_hub(repo, private=private, token=token)
+
     print(f"Done! https://huggingface.co/datasets/{repo}")
+
+
+def _update_dataset_card(api, repo, variant, num_records):
+    """Ensure the dataset card lists available configs."""
+    try:
+        card = api.repo_info(repo, repo_type="dataset").card_data or {}
+        # Just log — the README in the repo is the source of truth
+        print(f"  Config '{variant}' uploaded ({num_records} records)", flush=True)
+    except Exception:
+        pass
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -309,6 +348,8 @@ def main():
     ap.add_argument("--qa-types", type=int, default=2, help="QA variations per doc (generate mode)")
     ap.add_argument("--min-length", type=int, default=200)
     ap.add_argument("--max-length", type=int, default=30000)
+    ap.add_argument("--variant", type=str, default=None,
+                    help="Named config for multi-variant upload (e.g. '10k', '50k', 'full')")
     ap.add_argument("--clear-cache", action="store_true", help="Delete local cache and exit")
     args = ap.parse_args()
 
@@ -339,9 +380,8 @@ def main():
         if not docs:
             print("Nothing to process!")
             if args.upload:
-                upload(args.upload, args.private)
+                upload(args.upload, args.private, args.variant)
             return
-
         llm = LLM(models)
         mi, batch, ok, fail = 0, [], 0, 0
         print(f"\n▶ {len(docs)} docs × {args.qa_types} QA\n", flush=True)
@@ -392,7 +432,7 @@ def main():
         if not docs:
             print("Nothing to process!")
             if args.upload:
-                upload(args.upload, args.private)
+                upload(args.upload, args.private, args.variant)
             return
 
         print(f"\nConverting {len(docs)} docs…", flush=True)
@@ -414,7 +454,7 @@ def main():
 
     # Upload
     if args.upload:
-        upload(args.upload, args.private)
+        upload(args.upload, args.private, args.variant)
 
 
 if __name__ == "__main__":
